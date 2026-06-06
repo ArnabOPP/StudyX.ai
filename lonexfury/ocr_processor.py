@@ -192,44 +192,44 @@ def preprocess_image(img_path: str):
 
 def run_tesseract(img_path: str) -> Tuple[str, int, int]:
     """
-    Run Tesseract on an image file.
+    Run Tesseract on an image file with adaptive PSM selection.
     Returns (raw_text, img_width, img_height).
+
+    PSM strategy for academic content:
+      PSM 6  = uniform block of text (typed pages, clean notes)
+      PSM 11 = sparse text (handwritten notes, mixed diagrams+text)
+      PSM 4  = single column (lecture slides, textbook pages)
+    We try all three and pick the one that returns the most text.
     """
     import pytesseract
     from PIL import Image
 
-    # Configure Tesseract for handwritten/academic content
-    # PSM 6 = assume uniform block of text (good for notes)
-    # PSM 3 = fully automatic (good for mixed layouts)
-    custom_config = (
-        f"--oem 3 "           # LSTM engine (most accurate)
-        f"--psm 6 "           # uniform block of text
-        f"-l {TESSERACT_LANGS} "
-    )
+    base_config = f"--oem 3 -l {TESSERACT_LANGS} "
+    psm_configs = [
+        base_config + "--psm 6",   # uniform block — best for typed text
+        base_config + "--psm 11",  # sparse text — best for handwritten notes
+        base_config + "--psm 4",   # single column — best for slides/textbooks
+    ]
 
     preprocessed = preprocess_image(img_path)
     w, h         = preprocessed.size
 
-    try:
-        raw_text = pytesseract.image_to_string(preprocessed, config=custom_config)
-    except pytesseract.TesseractNotFoundError:
-        raise RuntimeError(
-            "Tesseract not found. Install from:\n"
-            "  Windows: https://github.com/UB-Mannheim/tesseract/wiki\n"
-            "  Linux:   sudo apt install tesseract-ocr tesseract-ocr-hin"
-        )
-
-    # Try PSM 3 if PSM 6 returned very little text
-    if len(raw_text.strip()) < 50:
-        alt_config = custom_config.replace("--psm 6", "--psm 3")
+    best_text = ""
+    for config in psm_configs:
         try:
-            alt_text = pytesseract.image_to_string(preprocessed, config=alt_config)
-            if len(alt_text.strip()) > len(raw_text.strip()):
-                raw_text = alt_text
+            text = pytesseract.image_to_string(preprocessed, config=config)
+            if len(text.strip()) > len(best_text.strip()):
+                best_text = text
+        except pytesseract.TesseractNotFoundError:
+            raise RuntimeError(
+                "Tesseract not found. Install from:\n"
+                "  Windows: https://github.com/UB-Mannheim/tesseract/wiki\n"
+                "  Linux:   sudo apt install tesseract-ocr tesseract-ocr-hin"
+            )
         except Exception:
-            pass
+            continue
 
-    return raw_text, w, h
+    return best_text, w, h
 
 
 # ─────────────────────────────────────────────

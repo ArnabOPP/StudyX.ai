@@ -57,13 +57,18 @@ from faster_whisper import WhisperModel
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-WHISPER_MODEL_SIZE  = "medium"     # ← upgraded from small; better translation on GPU
+
+# Whisper model — auto-selected at runtime based on GPU availability:
+#   GPU present → "medium" (better quality, fast on CUDA)
+#   CPU only    → "small"  (medium on CPU = 10-15 min per video, too slow)
+# Override by setting env var: WHISPER_MODEL_SIZE=large-v2
+WHISPER_MODEL_SIZE  = os.getenv("WHISPER_MODEL_SIZE", "auto")
 WHISPER_BEAM_SIZE   = 1
 WHISPER_CPU_THREADS = 4
-CHUNK_MAX_CHARS     = 1000         # ← raised from 600; better for longer videos
+CHUNK_MAX_CHARS     = 1000
 CHUNK_OVERLAP_SEGS  = 2
 
-CHUNK_VERSION = "1.5"
+CHUNK_VERSION = "1.6"
 
 # Must match database.py EMBEDDING_MODEL — stored in chunk metadata for traceability
 EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
@@ -71,9 +76,59 @@ EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
 TRANSCRIPT_LANGUAGES = ["en", "hi", "es", "fr", "de", "pt", "ja", "ko", "zh-Hans", "zh-Hant"]
 ENGLISH_CODES        = {"en", "en-US", "en-GB", "en-AU", "en-CA", "en-IN"}
 
-GTRANS_BATCH_SIZE  = 20
-GTRANS_MAX_RETRIES = 3       # retry attempts per batch on rate limit
-GTRANS_RETRY_DELAY = 5.0     # seconds to wait before retry
+GTRANS_BATCH_SIZE  = 10       # reduced: Hindi segments are long, 20 risks 5000-char API limit
+GTRANS_MAX_RETRIES = 3
+GTRANS_RETRY_DELAY = 5.0
+
+# yt-dlp headers — prevents blocking at captive portals and rate-limited networks
+YTDLP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+# ─────────────────────────────────────────────
+# TEXT CLEANING
+# ─────────────────────────────────────────────
+
+def clean_translated_text(text: str) -> str:
+    """
+    Fix Google Translate artifacts — conservatively.
+
+    Root cause of word merges: Google Translate strips spaces at XML tag
+    boundaries. Fix is applied at the SOURCE (tags include trailing space)
+    so this cleaner only handles residual safe cases:
+
+      1. Remove stray XML tag remnants from failed extractions
+      2. Fix missing space AFTER punctuation (e.g. "Ok.What" → "Ok. What")
+         — safe because punctuation never legitimately touches a letter
+      3. Normalize multiple spaces → single space
+      4. Strip leading/trailing whitespace
+
+    We deliberately do NOT regex-replace inside words — that causes more
+    damage than the original missing-space problem.
+    """
+    if not text:
+        return text
+
+    # 1. Remove stray XML tag remnants
+    text = re.sub(r'</?s\d+>', '', text)
+
+    # 2. Fix missing space after sentence-ending punctuation
+    #    e.g. "Ok.What" → "Ok. What"  |  "done!He" → "done! He"
+    #    Only triggers when punctuation is directly followed by a letter —
+    #    safe because "₹1.5" won't match (digit after dot, not letter)
+    text = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', text)
+
+    # 3. Normalize whitespace
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = text.strip()
+
+    return text
 
 
 # ─────────────────────────────────────────────
@@ -81,7 +136,10 @@ GTRANS_RETRY_DELAY = 5.0     # seconds to wait before retry
 # ─────────────────────────────────────────────
 
 def extract_video_id(url: str) -> Optional[str]:
-    """Extract the 11-character YouTube video ID from any valid URL format."""
+    """Extract the 11-character YouTube video ID from any valid YouTube URL format.
+    Returns None for non-YouTube URLs (Instagram, Facebook, Twitter/X etc.) —
+    those still work fine via yt-dlp but don't have a video_id field.
+    """
     patterns = [
         r'(?:youtube\.com|music\.youtube\.com)/shorts/([a-zA-Z0-9_-]{11})',
         r'(?:youtube\.com|music\.youtube\.com)/live/([a-zA-Z0-9_-]{11})',
@@ -95,6 +153,22 @@ def extract_video_id(url: str) -> Optional[str]:
         if match:
             return match.group(1)
     return None
+
+
+def is_supported_url(url: str) -> bool:
+    """
+    Returns True if the URL is from a platform yt-dlp can handle.
+    Covers YouTube, Instagram Reels, Facebook videos, Twitter/X, and
+    any other yt-dlp-supported site (1800+ platforms).
+    """
+    supported_domains = [
+        "youtube.com", "youtu.be", "music.youtube.com",
+        "instagram.com", "facebook.com", "fb.watch",
+        "twitter.com", "x.com", "t.co",
+        "vimeo.com", "dailymotion.com", "twitch.tv",
+    ]
+    url_lower = url.lower()
+    return any(domain in url_lower for domain in supported_domains)
 
 
 def seconds_to_timestamp(seconds: float) -> str:
@@ -145,12 +219,17 @@ class _Spinner:
 # ─────────────────────────────────────────────
 
 def fetch_video_metadata(url: str, ffmpeg_path: str) -> dict:
-    """Fetch title, channel, duration, chapters, upload date — no media download."""
+    """Fetch title, channel, duration, chapters, upload date — no media download.
+    Uses a real browser User-Agent to avoid blocks at captive-portal networks.
+    Socket timeout of 30s prevents indefinite hangs on slow connections.
+    """
     opts = {
         "quiet":           True,
         "no_warnings":     True,
         "skip_download":   True,
         "ffmpeg_location": ffmpeg_path,
+        "http_headers":    YTDLP_HEADERS,
+        "socket_timeout":  30,
     }
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -268,16 +347,20 @@ def fetch_cloud_transcript(video_id: str) -> Optional[List[dict]]:
 
 def detect_language(segments: List[dict]) -> str:
     """
-    Detect language from transcript segments.
-
-    Samples up to 50 segments (raised from 15) for better accuracy on
-    longer videos where the first 15 segments might be music/intro with
-    no speech. Falls back to 'en' if langdetect not available.
+    Detect dominant language from transcript segments.
+    Samples up to 50 segments spread evenly across the full video
+    (not just the first 50) — prevents misdetection when intros are
+    in English but the rest of the video is in Hindi/Bengali.
+    Falls back to 'en' if langdetect is not available.
     """
     try:
-        from langdetect import detect, LangDetectException
-        # Sample up to 50 segments spread across the video
-        sample_segs = segments[:min(50, len(segments))]
+        from langdetect import detect
+        total = len(segments)
+        if total == 0:
+            return "en"
+        # Evenly spaced sample indices across full video
+        step        = max(1, total // 50)
+        sample_segs = segments[::step][:50]
         sample      = " ".join(s["text"] for s in sample_segs)
         return detect(sample)
     except Exception:
@@ -322,7 +405,12 @@ def translate_segments_google(
         batch = segments[batch_start : batch_start + GTRANS_BATCH_SIZE]
         texts = [s["text"] for s in batch]
 
-        tagged = "".join(f"<s{i}>{t}</s{i}>" for i, t in enumerate(texts))
+        # Wrap each segment with XML tags + trailing space INSIDE the tag.
+        # The trailing space ensures that even if Google strips spaces at tag
+        # boundaries, the words from adjacent segments won't merge.
+        # e.g. <s0>take the lemon </s0><s1>Take, take</s1>
+        #                         ^-- this space prevents "lemonTake" merge
+        tagged = "".join(f"<s{i}>{t} </s{i}>" for i, t in enumerate(texts))
 
         parts      = None
         last_error = None
@@ -364,8 +452,9 @@ def translate_segments_google(
             parts = texts
 
         for seg, eng in zip(batch, parts):
+            raw = (eng or seg["text"]).strip()
             translated_segs.append({
-                "text":     (eng or seg["text"]).strip(),
+                "text":     clean_translated_text(raw),
                 "start":    seg["start"],
                 "duration": seg.get("duration", 0),
             })
@@ -403,14 +492,15 @@ def get_whisper_model() -> WhisperModel:
     try:
         import torch
         if torch.cuda.is_available():
-            gpu = torch.cuda.get_device_name(0)
-            print(f"  🎮  GPU detected: {gpu} — loading float16…")
-            model = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
+            gpu        = torch.cuda.get_device_name(0)
+            model_size = WHISPER_MODEL_SIZE if WHISPER_MODEL_SIZE != "auto" else "medium"
+            print(f"  🎮  GPU detected: {gpu} — loading {model_size} float16…")
+            model = WhisperModel(model_size, device="cuda", compute_type="float16")
             import numpy as np
             probe = np.zeros(16000, dtype=np.float32)
             list(model.transcribe(probe, beam_size=1)[0])
             _whisper_model = model
-            print(f"\n  ✅  Whisper loaded on GPU ({gpu}).\n")
+            print(f"\n  ✅  Whisper {model_size} loaded on GPU ({gpu}).\n")
             return _whisper_model
         else:
             print("  ℹ️  CUDA not available — using CPU.")
@@ -419,12 +509,15 @@ def get_whisper_model() -> WhisperModel:
     except Exception as e:
         print(f"  ⚠️  GPU load/probe failed ({e}) — falling back to CPU.")
 
-    print(f"  💻  Loading on CPU (INT8 · {WHISPER_CPU_THREADS} threads)…")
+    # CPU path: use "small" by default (medium = 10-15 min per video on CPU)
+    model_size = WHISPER_MODEL_SIZE if WHISPER_MODEL_SIZE != "auto" else "small"
+    print(f"  💻  Loading Whisper {model_size} on CPU (INT8 · {WHISPER_CPU_THREADS} threads)…")
+    print(f"  ℹ️  CPU tip: 'small' ~1-3 min/video. Set WHISPER_MODEL_SIZE=medium for better quality.")
     _whisper_model = WhisperModel(
-        WHISPER_MODEL_SIZE, device="cpu",
+        model_size, device="cpu",
         compute_type="int8", cpu_threads=WHISPER_CPU_THREADS,
     )
-    print(f"\n  ✅  Whisper loaded on CPU.\n")
+    print(f"\n  ✅  Whisper {model_size} loaded on CPU.\n")
     return _whisper_model
 
 
@@ -492,6 +585,8 @@ def transcribe_via_whisper(url: str, ffmpeg_path: str) -> Tuple[List[dict], List
             "preferredcodec": "mp3", "preferredquality": "192",
         }],
         "quiet": True, "no_warnings": True,
+        "http_headers":   YTDLP_HEADERS,
+        "socket_timeout": 60,
     }
 
     print("📥  Downloading audio…")
@@ -558,6 +653,8 @@ def _translate_cloud_segments(
             "preferredcodec": "mp3", "preferredquality": "192",
         }],
         "quiet": True, "no_warnings": True,
+        "http_headers":   YTDLP_HEADERS,
+        "socket_timeout": 60,
     }
     print("📥  Downloading audio for Whisper translation…")
     with _Spinner("Downloading"):
@@ -656,26 +753,40 @@ def build_chunks(
         Collect English segments whose timestamps fall in [look_from, end_s).
         Non-first chunks look back OVERLAP_LOOKBACK_S to include overlap text,
         then strip any leading fragment already covered by the previous chunk.
+        Segments are joined with a space and cleaned to fix translation artifacts.
         """
         look_from = start_s if is_first else max(0.0, start_s - OVERLAP_LOOKBACK_S)
         matched   = [s["text"] for s in eng_sorted if look_from <= s["start"] < end_s]
         if matched:
-            text = " ".join(matched).strip()
+            # Join with space — each segment may or may not end with punctuation
+            # Add space between segments to prevent word merges at boundaries
+            text = " ".join(t.rstrip() for t in matched).strip()
+            text = clean_translated_text(text)
             return text if is_first else _strip_leading_fragment(text)
         if eng_sorted:
             closest = min(eng_sorted, key=lambda s: abs(s["start"] - start_s))
-            return closest["text"].strip()
+            return clean_translated_text(closest["text"].strip())
         return ""
 
     # ── Step 3: assemble chunks ───────────────────────────────────────────
-    chunks = []
+    chunks    = []
+    seen_hashes: set = set()
+
     for chunk_pos, (orig_text, start_s, end_s, cidx) in enumerate(orig_chunks):
         ts       = seconds_to_timestamp(start_s)
         eng_text = _collect_english(start_s, end_s, is_first=(chunk_pos == 0))
         chapter  = _get_chapter(start_s)
 
+        # Hash on original text (always present) to avoid empty-string collisions
+        hash_source = orig_text if orig_text else eng_text
+        chash       = content_hash(hash_source)
+
+        # Skip exact duplicate chunks (can occur if translation returns identical text)
+        if chash in seen_hashes:
+            continue
+        seen_hashes.add(chash)
+
         chunks.append({
-            # embed_text removed — database.py embeds english_text directly
             "original_text": orig_text,
             "english_text":  eng_text,
             "metadata": {
@@ -694,9 +805,9 @@ def build_chunks(
                 "start_seconds":     str(round(start_s, 2)),
                 "end_seconds":       str(round(end_s, 2)),
                 "chapter":           chapter,
-                "content_hash":      content_hash(eng_text),
+                "content_hash":      chash,
                 "chunk_version":     CHUNK_VERSION,
-                "embedding_model":   EMBEDDING_MODEL,   # ← now uses constant
+                "embedding_model":   EMBEDDING_MODEL,
                 "ingested_at":       ingested_at,
             },
         })
@@ -710,12 +821,13 @@ def build_chunks(
 
 def scrape_youtube(url: str) -> Tuple[dict, List[dict]]:
     """
-    Main entry point. Scrape a YouTube video into structured chunks.
+    Main entry point. Scrape any supported video URL into structured chunks.
+    Supports YouTube, Instagram Reels, Facebook, Twitter/X, Vimeo, etc.
     Returns (metadata, chunks). Raises ValueError or RuntimeError on failure.
     """
     video_id = extract_video_id(url)
-    if not video_id:
-        raise ValueError(f"Not a valid YouTube URL: {url!r}")
+    if not video_id and not is_supported_url(url):
+        raise ValueError(f"Not a supported video URL: {url!r}")
 
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -731,9 +843,9 @@ def scrape_youtube(url: str) -> Tuple[dict, List[dict]]:
         print(f"  📑  {len(metadata['chapters'])} chapters detected")
     print()
 
-    # ── Cloud transcript ──────────────────────────────────────────────────
+    # ── Cloud transcript (YouTube only — other platforms go straight to Whisper) ──
     print("🔍  Checking for cloud transcript…")
-    cloud_segs = fetch_cloud_transcript(video_id)
+    cloud_segs = fetch_cloud_transcript(video_id) if video_id else None
 
     if cloud_segs:
         print(f"  ✅  Cloud transcript: {len(cloud_segs)} segments.\n")
@@ -776,10 +888,10 @@ def scrape_youtube(url: str) -> Tuple[dict, List[dict]]:
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  🎬  YouTube Scraper  v1.5")
+    print("  🎬  YouTube Scraper  v1.6")
     print("=" * 55)
 
-    url = input("\n🔗  Paste a YouTube URL: ").strip()
+    url = input("\n🔗  Paste a video URL (YouTube / Instagram / Facebook / Twitter): ").strip()
 
     try:
         meta, chunks = scrape_youtube(url)

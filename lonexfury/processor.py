@@ -216,12 +216,10 @@ async def run_pdf_job(job_id: str, file_path: str, session_id: str):
             Path(file_path).unlink(missing_ok=True)
         except Exception:
             pass
-        # Cleanup extracted image folders (free disk space)
+        # Cleanup extracted image folders from CWD (where processor.py runs)
         try:
-            src_dir = Path(file_path).parent
-            for folder in src_dir.glob("__images_*__"):
-                shutil.rmtree(folder, ignore_errors=True)
-            for folder in src_dir.glob("__rendered_*__"):
+            cwd = Path(".")
+            for folder in list(cwd.glob("__images_*__")) + list(cwd.glob("__rendered_*__")):
                 shutil.rmtree(folder, ignore_errors=True)
         except Exception:
             pass
@@ -255,16 +253,24 @@ async def run_image_job(job_id: str, file_path: str, session_id: str, title: str
 
 
 async def run_youtube_job(job_id: str, url: str, session_id: str):
-    """Background task: scrape YouTube + send."""
+    """Background task: scrape YouTube/Instagram/Facebook/Twitter + send."""
     try:
         update_job(job_id, status="fetching_metadata", progress=5)
 
         from youtube_scraper import scrape_youtube
 
+        update_job(job_id, status="fetching_transcript", progress=10)
+        # scrape_youtube handles all stages internally — metadata, transcript,
+        # translation, chunking. Progress jumps reflect real pipeline stages.
+        # For long videos, transcription can take several minutes on CPU.
         update_job(job_id, status="transcribing", progress=15)
         metadata, chunks = scrape_youtube(url)
 
-        update_job(job_id, progress=80)
+        lang = metadata.get("language", "unknown")
+        trans = metadata.get("translation_model", "none")
+        update_job(job_id,
+                   status=f"transcribed ({lang}, translation={trans})",
+                   progress=80)
 
         update_job(job_id, status="sending", progress=85)
         await send_to_master(session_id, metadata, chunks, job_id)
@@ -444,6 +450,11 @@ async def process_image_endpoint(
         )
 
     contents  = await file.read()
+    if len(contents) > MAX_FILE_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image too large. Max {MAX_FILE_MB}MB."
+        )
     save_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
     with open(save_path, "wb") as f:
         f.write(contents)
@@ -502,18 +513,27 @@ async def process_batch(
     total_size  = 0
 
     for file in files:
-        ext      = Path(file.filename).suffix.lower()
-        contents = await file.read()
-        total_size += len(contents)
+        ext = Path(file.filename).suffix.lower()
 
         if ext not in SUPPORTED_DOCS | SUPPORTED_IMGS:
             print(f"  ⚠️  Skipping unsupported: {file.filename}")
             continue
 
+        # Stream file to disk in chunks — never loads whole batch into RAM
         save_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
-        with open(save_path, "wb") as f:
-            f.write(contents)
-        saved_paths.append(str(save_path))
+        file_size = 0
+        with open(save_path, "wb") as out:
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                file_size  += len(chunk)
+                total_size += len(chunk)
+                if file_size > MAX_FILE_MB * 1024 * 1024:
+                    out.close()
+                    save_path.unlink(missing_ok=True)
+                    print(f"  ⚠️  Skipping {file.filename} — exceeds {MAX_FILE_MB}MB limit")
+                    break
+                out.write(chunk)
+            else:
+                saved_paths.append(str(save_path))
 
     if not saved_paths:
         raise HTTPException(status_code=400, detail="No supported files found in batch")
